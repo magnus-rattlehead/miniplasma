@@ -1,0 +1,16 @@
+CompileFlags:
+  Compiler: /opt/homebrew/opt/mingw-w64/toolchain-x86_64/bin/x86_64-w64-mingw32-gcc
+  Add:
+    - --target=x86_64-w64-mingw32
+    - -D_WIN32
+    - -D_WIN64
+    - -D__MINGW32__
+    - -D__MINGW64__
+    - -isystem
+    - /opt/homebrew/opt/mingw-w64/toolchain-x86_64/x86_64-w64-mingw32/include
+  Remove:
+    - -mconsole
+
+Diagnostics:
+  Suppress:
+    - pp_file_not_found
